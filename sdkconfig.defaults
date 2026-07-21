@@ -1,0 +1,16 @@
+# Flash size
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# Partition table - use single app large (1.5MB app partition)
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp_large.csv"
+
+# PSRAM 配置 - 启用但限制大块分配，避免 WiFi/flash 操作期间 cache 错误
+# 让 malloc 优先使用内部 RAM，只有明确请求时才使用 PSRAM
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI=y
+
+# WiFi 配置 - 确保 WiFi 缓冲区在内部 RAM
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32

@@ -1,0 +1,10 @@
+.pio/
+.vscode/
+*.pyc
+__pycache__/
+.DS_Store
+*.bin
+*.elf
+*.map
+.pioenvs/
+.piolibdeps/
