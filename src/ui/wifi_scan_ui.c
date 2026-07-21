@@ -565,12 +565,12 @@ static void update_remote_id_page(void)
         lv_obj_set_style_bg_opa(list_btn, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(list_btn, 6, 0);
         lv_obj_set_style_pad_all(list_btn, 0, 0);
-        lv_obj_set_size(list_btn, 260, 40);
+        lv_obj_set_size(list_btn, 256, 40);
         lv_obj_add_event_cb(list_btn, ap_item_pressed_cb, LV_EVENT_PRESSED, (void*)(intptr_t)rid_idx);
         lv_obj_add_event_cb(list_btn, rid_item_released_cb, LV_EVENT_RELEASED, (void*)(intptr_t)rid_idx);
 
         lv_obj_t *row = lv_obj_create(list_btn);
-        lv_obj_set_size(row, 250, 34);
+        lv_obj_set_size(row, 246, 34);
         lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
         lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
@@ -732,7 +732,7 @@ static void create_ap_list_page(lv_obj_t *parent)
     /* 下方：Scan + Auto + CH 三个按钮 */
     s_ap_scan_btn = lv_btn_create(page);
     lv_obj_set_size(s_ap_scan_btn, 76, 32);
-    lv_obj_align(s_ap_scan_btn, LV_ALIGN_TOP_MID, -80, 88);
+    lv_obj_align(s_ap_scan_btn, LV_ALIGN_TOP_MID, -80, 90);
     lv_obj_set_style_bg_color(s_ap_scan_btn, lv_color_hex(0x1E88E5), 0);
     lv_obj_set_style_radius(s_ap_scan_btn, 8, 0);
     lv_obj_add_event_cb(s_ap_scan_btn, scan_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -743,7 +743,7 @@ static void create_ap_list_page(lv_obj_t *parent)
 
     s_ap_auto_btn = lv_btn_create(page);
     lv_obj_set_size(s_ap_auto_btn, 76, 32);
-    lv_obj_align(s_ap_auto_btn, LV_ALIGN_TOP_MID, 0, 88);
+    lv_obj_align(s_ap_auto_btn, LV_ALIGN_TOP_MID, 0, 90);
     lv_obj_set_style_bg_color(s_ap_auto_btn, lv_color_hex(0x37474F), 0);
     lv_obj_set_style_radius(s_ap_auto_btn, 8, 0);
     lv_obj_add_event_cb(s_ap_auto_btn, auto_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -810,12 +810,12 @@ static void update_ap_list_page(void)
         lv_obj_set_style_bg_opa(list_btn, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(list_btn, 6, 0);
         lv_obj_set_style_pad_all(list_btn, 0, 0);
-        lv_obj_set_size(list_btn, 280, 36);
+        lv_obj_set_size(list_btn, 264, 36);
         lv_obj_add_event_cb(list_btn, ap_item_pressed_cb, LV_EVENT_PRESSED, (void*)(intptr_t)i);
         lv_obj_add_event_cb(list_btn, ap_item_released_cb, LV_EVENT_RELEASED, (void*)(intptr_t)i);
 
         lv_obj_t *row = lv_obj_create(list_btn);
-        lv_obj_set_size(row, 270, 30);
+        lv_obj_set_size(row, 254, 30);
         lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
         lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
