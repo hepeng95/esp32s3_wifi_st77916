@@ -38,13 +38,13 @@ typedef struct {
     uint8_t second_channel;     /* 辅信道: 0=none, 1=above, 2=below */
     wifi_auth_mode_t auth_mode;
     bool is_hidden;             /* 隐藏 WiFi（SSID 为空） */
-    
+
     bool is_remote_id;          /* 是否 Remote ID 设备 */
     char remote_id[64];         /* 提取的 ID 字符串 */
-    
-    /* GB 46750-2025 国标字段 */
+
+    /* GB 46750-2025 / OpenDroneID 字段 */
     uint8_t rid_version;        /* RID 版本号 */
-    char rid_code[33];          /* 设备识别编码（16位十六进制） */
+    char rid_code[33];          /* 设备识别编码 */
     rid_device_type_t device_type;   /* 设备类型 */
     rid_operation_state_t op_state;  /* 运行状态 */
     float latitude;             /* 纬度（度） */
@@ -52,6 +52,16 @@ typedef struct {
     int32_t altitude;           /* 高度（米） */
     float speed;                /* 速度（米/秒） */
     uint32_t timestamp;         /* 时间戳（UTC） */
+
+    /* OpenDroneID 协议字段 */
+    bool rid_from_beacon;       /* RID 来自 Beacon Vendor IE (true) 或 SSID 推断 (false) */
+    char uas_id[21];            /* UAS ID (无人机系统识别码, 最长20字节) */
+    char operator_id[21];       /* 操作者 ID */
+    float ground_speed;         /* 地速 (m/s) */
+    float vertical_speed;       /* 垂直速度 (m/s) */
+    float heading;              /* 航向 (度) */
+    uint8_t satellites;         /* 卫星数 */
+    char self_id_desc[24];      /* Self ID 描述 */
 } wifi_ap_info_t;
 
 typedef struct {

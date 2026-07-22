@@ -7,6 +7,10 @@
 
 static const char *TAG = "wifi_scan_ui";
 
+/* 翻页函数前向声明 */
+static void update_ap_list_page(void);
+static void update_remote_id_page(void);
+
 /* ============ 页面状态 ============ */
 typedef enum {
     PAGE_AP_LIST = 0,    /* AP 列表页 */
@@ -20,10 +24,6 @@ static lv_obj_t *s_root = NULL;
 static lv_obj_t *s_pages[PAGE_COUNT] = {0};
 static ui_page_t s_current_page = PAGE_AP_LIST;
 
-static int s_press_x = 0;
-static int s_press_y = 0;
-static void ap_item_pressed_cb(lv_event_t *e);
-
 /* AP 列表页元素 */
 static lv_obj_t *s_ap_list_title = NULL;
 static lv_obj_t *s_ap_count_label = NULL;
@@ -35,6 +35,14 @@ static lv_obj_t *s_ap_ch_btn = NULL;       /* 跳转到信道页 */
 static lv_obj_t *s_ap_rid_btn = NULL;      /* 跳转到 Remote ID 页 */
 static lv_timer_t *s_update_timer = NULL;
 static int s_last_ap_count = -1;
+
+/* AP 列表翻页 */
+static int s_ap_page = 0;
+static int s_ap_total_pages = 1;
+static lv_obj_t *s_ap_prev_btn = NULL;
+static lv_obj_t *s_ap_next_btn = NULL;
+static lv_obj_t *s_ap_page_label = NULL;
+#define AP_LIST_PAGE_SIZE  4
 
 /* 自动刷新 */
 static bool s_auto_refresh = false;
@@ -56,6 +64,14 @@ static lv_obj_t *s_rid_back_btn = NULL;
 static lv_obj_t *s_rid_count = NULL;
 static lv_obj_t *s_rid_list = NULL;
 static int s_last_rid_count = -1;
+
+/* RID 列表翻页 */
+static int s_rid_page = 0;
+static int s_rid_total_pages = 1;
+static lv_obj_t *s_rid_prev_btn = NULL;
+static lv_obj_t *s_rid_next_btn = NULL;
+static lv_obj_t *s_rid_page_label = NULL;
+#define RID_LIST_PAGE_SIZE  4
 
 /* 延迟自动扫描 */
 static lv_timer_t *s_delay_timer = NULL;
@@ -211,7 +227,7 @@ static void update_detail_page(void)
         snprintf(ch_str, sizeof(ch_str), "%d", ap->primary_channel);
     }
 
-    char buf[1024];
+    char buf[1600];
     if (ap->is_remote_id) {
         snprintf(buf, sizeof(buf),
             "SSID: %s\n"
@@ -220,12 +236,22 @@ static void update_detail_page(void)
             "Signal: %d%%\n"
             "Channel: %s\n"
             "Auth: %s\n"
+            "Source: %s\n"
             "--- RID ---\n"
             "RID Code: %s\n"
+            "UAS ID: %s\n"
+            "Operator: %s\n"
             "Type: %s\n"
             "State: %s\n"
-            "Loc: %.4f, %.4f\n"
-            "Alt: %ldm  Spd: %.1fm/s",
+            "Lat: %.6f\n"
+            "Lon: %.6f\n"
+            "Alt: %ldm\n"
+            "GSpd: %.1fm/s\n"
+            "VSpd: %.1fm/s\n"
+            "Hdg: %.1fdeg\n"
+            "Sats: %d\n"
+            "Self ID: %s\n"
+            "Ver: %d",
             ap->ssid,
             ap->bssid[0], ap->bssid[1], ap->bssid[2],
             ap->bssid[3], ap->bssid[4], ap->bssid[5],
@@ -233,11 +259,20 @@ static void update_detail_page(void)
             wifi_rssi_percentage(ap->rssi),
             ch_str,
             wifi_auth_mode_str(ap->auth_mode),
+            ap->rid_from_beacon ? "Beacon IE" : "SSID",
             ap->rid_code[0] ? ap->rid_code : ap->remote_id,
+            ap->uas_id[0] ? ap->uas_id : "-",
+            ap->operator_id[0] ? ap->operator_id : "-",
             wifi_rid_device_type_str(ap->device_type),
             wifi_rid_op_state_str(ap->op_state),
             ap->latitude, ap->longitude,
-            ap->altitude, ap->speed);
+            ap->altitude,
+            ap->ground_speed,
+            ap->vertical_speed,
+            ap->heading,
+            ap->satellites,
+            ap->self_id_desc[0] ? ap->self_id_desc : "-",
+            ap->rid_version);
     } else {
         snprintf(buf, sizeof(buf),
             "SSID: %s\n"
@@ -437,17 +472,8 @@ static void rid_back_cb(lv_event_t *e)
     switch_page(PAGE_AP_LIST);
 }
 
-static void rid_item_released_cb(lv_event_t *e)
+static void rid_item_clicked_cb(lv_event_t *e)
 {
-    lv_point_t *p = lv_event_get_param(e);
-    if (!p) return;
-    
-    int dx = p->x - s_press_x;
-    int dy = p->y - s_press_y;
-    int dist = dx * dx + dy * dy;
-    
-    if (dist >= 256) return;
-
     int rid_idx = (int)(intptr_t)lv_event_get_user_data(e);
 
     wifi_scan_result_t result;
@@ -469,6 +495,26 @@ static void rid_item_released_cb(lv_event_t *e)
     s_detail_ap_index = global_idx;
     update_detail_page();
     switch_page(PAGE_AP_DETAIL);
+}
+
+static void rid_prev_page_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_rid_page > 0) {
+        s_rid_page--;
+        s_last_rid_count = -1;
+        update_remote_id_page();
+    }
+}
+
+static void rid_next_page_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_rid_page < s_rid_total_pages - 1) {
+        s_rid_page++;
+        s_last_rid_count = -1;
+        update_remote_id_page();
+    }
 }
 
 static void create_remote_id_page(lv_obj_t *parent)
@@ -509,21 +555,43 @@ static void create_remote_id_page(lv_obj_t *parent)
     lv_obj_set_style_text_color(s_rid_count, lv_color_hex(0xCE93D8), 0);
     lv_obj_align(s_rid_count, LV_ALIGN_TOP_MID, 0, 96);
 
-    s_rid_list = lv_list_create(page);
-    lv_obj_set_size(s_rid_list, 280, 210);
-    lv_obj_align(s_rid_list, LV_ALIGN_TOP_MID, 0, 120);
+    s_rid_list = lv_obj_create(page);
+    lv_obj_set_size(s_rid_list, 280, 180);
+    lv_obj_align(s_rid_list, LV_ALIGN_TOP_MID, 0, 112);
     lv_obj_set_style_bg_color(s_rid_list, lv_color_hex(0x0D1320), 0);
     lv_obj_set_style_bg_opa(s_rid_list, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_rid_list, 10, 0);
     lv_obj_set_style_border_opa(s_rid_list, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_all(s_rid_list, 6, 0);
-    lv_obj_add_flag(s_rid_list, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(s_rid_list, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(s_rid_list, LV_SCROLLBAR_MODE_ON);
-    lv_obj_set_style_width(s_rid_list, 12, LV_PART_SCROLLBAR);
-    lv_obj_set_style_radius(s_rid_list, 6, LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_color(s_rid_list, lv_color_hex(0x4A148C), LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_color(s_rid_list, lv_color_hex(0x7B1FA2), LV_PART_SCROLLBAR | LV_STATE_PRESSED);
+    lv_obj_set_style_pad_all(s_rid_list, 4, 0);
+    lv_obj_clear_flag(s_rid_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_rid_prev_btn = lv_btn_create(page);
+    lv_obj_set_size(s_rid_prev_btn, 70, 28);
+    lv_obj_align(s_rid_prev_btn, LV_ALIGN_TOP_MID, -80, 298);
+    lv_obj_set_style_bg_color(s_rid_prev_btn, lv_color_hex(0x4A148C), 0);
+    lv_obj_set_style_radius(s_rid_prev_btn, 8, 0);
+    lv_obj_add_event_cb(s_rid_prev_btn, rid_prev_page_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *rid_prev_lbl = lv_label_create(s_rid_prev_btn);
+    lv_label_set_text(rid_prev_lbl, "< Prev");
+    lv_obj_set_style_text_font(rid_prev_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(rid_prev_lbl);
+
+    s_rid_page_label = lv_label_create(page);
+    lv_label_set_text(s_rid_page_label, "1/1");
+    lv_obj_set_style_text_font(s_rid_page_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_rid_page_label, lv_color_hex(0xCE93D8), 0);
+    lv_obj_align(s_rid_page_label, LV_ALIGN_TOP_MID, 0, 302);
+
+    s_rid_next_btn = lv_btn_create(page);
+    lv_obj_set_size(s_rid_next_btn, 70, 28);
+    lv_obj_align(s_rid_next_btn, LV_ALIGN_TOP_MID, 80, 298);
+    lv_obj_set_style_bg_color(s_rid_next_btn, lv_color_hex(0x4A148C), 0);
+    lv_obj_set_style_radius(s_rid_next_btn, 8, 0);
+    lv_obj_add_event_cb(s_rid_next_btn, rid_next_page_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *rid_next_lbl = lv_label_create(s_rid_next_btn);
+    lv_label_set_text(rid_next_lbl, "Next >");
+    lv_obj_set_style_text_font(rid_next_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(rid_next_lbl);
 }
 
 static void update_remote_id_page(void)
@@ -533,102 +601,113 @@ static void update_remote_id_page(void)
     wifi_scan_result_t result;
     wifi_scan_get_result(&result);
 
-    /* 统计 Remote ID 数量 */
     int rid_count = 0;
     for (int i = 0; i < result.ap_count; i++) {
-        if (result.aps[i].is_remote_id) rid_count++;
+        if (result.aps[i].is_remote_id) {
+            rid_count++;
+            ESP_LOGI(TAG, "RID found [%d]: SSID='%s'", i, result.aps[i].ssid);
+        }
     }
+    ESP_LOGI(TAG, "Total APs: %d, RID count: %d", result.ap_count, rid_count);
 
     lv_label_set_text_fmt(s_rid_count, "%d device%s",
                           rid_count, rid_count == 1 ? "" : "s");
 
-    /* 只有数量变化时才重建列表 */
+    s_rid_total_pages = (rid_count + RID_LIST_PAGE_SIZE - 1) / RID_LIST_PAGE_SIZE;
+    if (s_rid_total_pages < 1) s_rid_total_pages = 1;
+    if (s_rid_page >= s_rid_total_pages) s_rid_page = s_rid_total_pages - 1;
+
+    lv_label_set_text_fmt(s_rid_page_label, "%d/%d", s_rid_page + 1, s_rid_total_pages);
+
+    if (s_rid_prev_btn) {
+        if (s_rid_page == 0) {
+            lv_obj_add_flag(s_rid_prev_btn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(s_rid_prev_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_rid_next_btn) {
+        if (s_rid_page >= s_rid_total_pages - 1) {
+            lv_obj_add_flag(s_rid_next_btn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(s_rid_next_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     if (s_last_rid_count == rid_count && rid_count > 0) return;
     s_last_rid_count = rid_count;
 
     lv_obj_clean(s_rid_list);
 
     if (rid_count == 0) {
-        lv_list_add_text(s_rid_list, "No Remote ID devices");
+        lv_obj_t *empty_lbl = lv_label_create(s_rid_list);
+        lv_label_set_text(empty_lbl, "No Remote ID devices");
+        lv_obj_set_style_text_font(empty_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty_lbl, lv_color_hex(0x607D8B), 0);
         return;
     }
 
-    ESP_LOGI(TAG, "Rebuilding RID list: %d devices", rid_count);
+    int start_idx = s_rid_page * RID_LIST_PAGE_SIZE;
+    int end_idx = start_idx + RID_LIST_PAGE_SIZE;
+    if (end_idx > rid_count) end_idx = rid_count;
+
+    ESP_LOGI(TAG, "Displaying RID list page %d: items %d-%d", s_rid_page + 1, start_idx, end_idx - 1);
 
     int rid_idx = 0;
+    int display_idx = 0;
     for (int i = 0; i < result.ap_count; i++) {
         wifi_ap_info_t *ap = &result.aps[i];
         if (!ap->is_remote_id) continue;
 
-        lv_obj_t *list_btn = lv_list_add_btn(s_rid_list, NULL, "");
-        lv_obj_set_style_bg_color(list_btn, lv_color_hex(0x1A0F2E), 0);
-        lv_obj_set_style_bg_opa(list_btn, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(list_btn, 6, 0);
-        lv_obj_set_style_pad_all(list_btn, 0, 0);
-        lv_obj_set_size(list_btn, 256, 40);
-        lv_obj_add_event_cb(list_btn, ap_item_pressed_cb, LV_EVENT_PRESSED, (void*)(intptr_t)rid_idx);
-        lv_obj_add_event_cb(list_btn, rid_item_released_cb, LV_EVENT_RELEASED, (void*)(intptr_t)rid_idx);
+        if (rid_idx >= start_idx && rid_idx < end_idx) {
+            int item_y = (rid_idx - start_idx) * 42 + 2;
 
-        lv_obj_t *row = lv_obj_create(list_btn);
-        lv_obj_set_size(row, 246, 34);
-        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_pad_all(row, 0, 0);
-        lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
-        lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_t *list_btn = lv_obj_create(s_rid_list);
+            lv_obj_set_size(list_btn, 248, 40);
+            lv_obj_set_pos(list_btn, 6, item_y);
+            lv_obj_set_style_bg_color(list_btn, lv_color_hex(0x1A0F2E), 0);
+            lv_obj_set_style_bg_opa(list_btn, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(list_btn, 6, 0);
+            lv_obj_set_style_pad_all(list_btn, 0, 0);
+            lv_obj_add_event_cb(list_btn, rid_item_clicked_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)rid_idx);
 
-        /* ID 名称（紫色） */
-        lv_obj_t *name_lbl = lv_label_create(row);
-        lv_label_set_text_fmt(name_lbl, "%s", ap->remote_id);
-        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xCE93D8), 0);
-        lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 4, 0);
-        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(name_lbl, 180);
-        lv_obj_add_flag(name_lbl, LV_OBJ_FLAG_EVENT_BUBBLE);
+            lv_obj_t *row = lv_obj_create(list_btn);
+            lv_obj_set_size(row, 238, 34);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_all(row, 0, 0);
+            lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
+            lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);
 
-        /* 点击箭头提示 */
-        lv_obj_t *arrow_lbl = lv_label_create(row);
-        lv_label_set_text(arrow_lbl, ">");
-        lv_obj_set_style_text_font(arrow_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(arrow_lbl, lv_color_hex(0xCE93D8), 0);
-        lv_obj_align(arrow_lbl, LV_ALIGN_TOP_RIGHT, -4, 0);
-        lv_obj_add_flag(arrow_lbl, LV_OBJ_FLAG_EVENT_BUBBLE);
+            lv_obj_t *name_lbl = lv_label_create(row);
+            lv_label_set_text_fmt(name_lbl, "%s", ap->remote_id);
+            lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xCE93D8), 0);
+            lv_obj_align(name_lbl, LV_ALIGN_LEFT_MID, 4, -6);
+            lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(name_lbl, 170);
+            lv_obj_add_flag(name_lbl, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-        /* RSSI 数值 */
-        lv_obj_t *rssi_lbl = lv_label_create(row);
-        lv_label_set_text_fmt(rssi_lbl, "%d dBm", ap->rssi);
-        lv_obj_set_style_text_font(rssi_lbl, &lv_font_montserrat_10, 0);
-        lv_obj_set_style_text_color(rssi_lbl, lv_color_hex(0x8892A4), 0);
-        lv_obj_align(rssi_lbl, LV_ALIGN_TOP_RIGHT, -20, 0);
-        lv_obj_add_flag(rssi_lbl, LV_OBJ_FLAG_EVENT_BUBBLE);
+            lv_obj_t *rssi_lbl = lv_label_create(row);
+            lv_label_set_text_fmt(rssi_lbl, "%d dBm", ap->rssi);
+            lv_obj_set_style_text_font(rssi_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(rssi_lbl, wifi_rssi_color(ap->rssi), 0);
+            lv_obj_align(rssi_lbl, LV_ALIGN_RIGHT_MID, -4, -6);
+            lv_obj_add_flag(rssi_lbl, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-        /* 信道 + 设备类型 + 状态 */
-        lv_obj_t *ch_lbl = lv_label_create(row);
-        lv_label_set_text_fmt(ch_lbl, "CH%d | %s | %s", 
-            ap->channel,
-            wifi_rid_device_type_str(ap->device_type),
-            wifi_rid_op_state_str(ap->op_state));
-        lv_obj_set_style_text_font(ch_lbl, &lv_font_montserrat_8, 0);
-        lv_obj_set_style_text_color(ch_lbl, lv_color_hex(0x607D8B), 0);
-        lv_obj_align(ch_lbl, LV_ALIGN_BOTTOM_LEFT, 4, 0);
-        lv_label_set_long_mode(ch_lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(ch_lbl, 200);
-        lv_obj_add_flag(ch_lbl, LV_OBJ_FLAG_EVENT_BUBBLE);
+            lv_obj_t *info_lbl = lv_label_create(row);
+            lv_label_set_text_fmt(info_lbl, "CH%d | %s | %s",
+                ap->channel,
+                wifi_rid_device_type_str(ap->device_type),
+                wifi_rid_op_state_str(ap->op_state));
+            lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x8892A4), 0);
+            lv_obj_align(info_lbl, LV_ALIGN_LEFT_MID, 4, 10);
+            lv_obj_add_flag(info_lbl, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-        /* RSSI 条 */
-        lv_obj_t *rssi_bar = lv_bar_create(row);
-        lv_obj_set_size(rssi_bar, 60, 6);
-        lv_obj_align(rssi_bar, LV_ALIGN_BOTTOM_RIGHT, -4, 0);
-        lv_obj_set_style_bg_color(rssi_bar, lv_color_hex(0x2A1B3D), 0);
-        lv_obj_set_style_bg_opa(rssi_bar, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(rssi_bar, 3, 0);
-        lv_obj_set_style_bg_color(rssi_bar, wifi_rssi_color(ap->rssi), LV_PART_INDICATOR);
-        lv_obj_set_style_radius(rssi_bar, 3, LV_PART_INDICATOR);
-        lv_bar_set_value(rssi_bar, wifi_rssi_percentage(ap->rssi), LV_ANIM_OFF);
-        lv_obj_add_flag(rssi_bar, LV_OBJ_FLAG_EVENT_BUBBLE);
-
+            display_idx++;
+        }
         rid_idx++;
     }
 }
@@ -657,30 +736,32 @@ static void nav_to_rid_cb(lv_event_t *e)
     switch_page(PAGE_REMOTE_ID);
 }
 
-static void ap_item_pressed_cb(lv_event_t *e)
+static void ap_item_clicked_cb(lv_event_t *e)
 {
-    lv_point_t *p = lv_event_get_param(e);
-    if (p) {
-        s_press_x = p->x;
-        s_press_y = p->y;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    s_detail_ap_index = idx;
+    ESP_LOGI(TAG, "AP item clicked, index=%d", idx);
+    update_detail_page();
+    switch_page(PAGE_AP_DETAIL);
+}
+
+static void ap_prev_page_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_ap_page > 0) {
+        s_ap_page--;
+        s_last_ap_count = -1;
+        update_ap_list_page();
     }
 }
 
-static void ap_item_released_cb(lv_event_t *e)
+static void ap_next_page_cb(lv_event_t *e)
 {
-    lv_point_t *p = lv_event_get_param(e);
-    if (!p) return;
-    
-    int dx = p->x - s_press_x;
-    int dy = p->y - s_press_y;
-    int dist = dx * dx + dy * dy;
-    
-    if (dist < 256) {
-        int idx = (int)(intptr_t)lv_event_get_user_data(e);
-        s_detail_ap_index = idx;
-        ESP_LOGI(TAG, "AP item clicked, index=%d", idx);
-        update_detail_page();
-        switch_page(PAGE_AP_DETAIL);
+    (void)e;
+    if (s_ap_page < s_ap_total_pages - 1) {
+        s_ap_page++;
+        s_last_ap_count = -1;
+        update_ap_list_page();
     }
 }
 
@@ -763,21 +844,43 @@ static void create_ap_list_page(lv_obj_t *parent)
     lv_obj_set_style_text_font(ch_lbl, &lv_font_montserrat_14, 0);
     lv_obj_center(ch_lbl);
 
-    s_ap_list = lv_list_create(page);
-    lv_obj_set_size(s_ap_list, 290, 200);
-    lv_obj_align(s_ap_list, LV_ALIGN_TOP_MID, 0, 128);
+    s_ap_list = lv_obj_create(page);
+    lv_obj_set_size(s_ap_list, 280, 168);
+    lv_obj_align(s_ap_list, LV_ALIGN_TOP_MID, 0, 124);
     lv_obj_set_style_bg_color(s_ap_list, lv_color_hex(0x0D1320), 0);
     lv_obj_set_style_bg_opa(s_ap_list, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_ap_list, 10, 0);
     lv_obj_set_style_border_opa(s_ap_list, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_all(s_ap_list, 6, 0);
-    lv_obj_add_flag(s_ap_list, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(s_ap_list, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(s_ap_list, LV_SCROLLBAR_MODE_ON);
-    lv_obj_set_style_width(s_ap_list, 12, LV_PART_SCROLLBAR);
-    lv_obj_set_style_radius(s_ap_list, 6, LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_color(s_ap_list, lv_color_hex(0x37474F), LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_color(s_ap_list, lv_color_hex(0x607D8B), LV_PART_SCROLLBAR | LV_STATE_PRESSED);
+    lv_obj_set_style_pad_all(s_ap_list, 4, 0);
+    lv_obj_clear_flag(s_ap_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ap_prev_btn = lv_btn_create(page);
+    lv_obj_set_size(s_ap_prev_btn, 70, 28);
+    lv_obj_align(s_ap_prev_btn, LV_ALIGN_TOP_MID, -80, 298);
+    lv_obj_set_style_bg_color(s_ap_prev_btn, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_radius(s_ap_prev_btn, 8, 0);
+    lv_obj_add_event_cb(s_ap_prev_btn, ap_prev_page_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *prev_lbl = lv_label_create(s_ap_prev_btn);
+    lv_label_set_text(prev_lbl, "< Prev");
+    lv_obj_set_style_text_font(prev_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(prev_lbl);
+
+    s_ap_page_label = lv_label_create(page);
+    lv_label_set_text(s_ap_page_label, "1/1");
+    lv_obj_set_style_text_font(s_ap_page_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_ap_page_label, lv_color_hex(0x8892A4), 0);
+    lv_obj_align(s_ap_page_label, LV_ALIGN_TOP_MID, 0, 302);
+
+    s_ap_next_btn = lv_btn_create(page);
+    lv_obj_set_size(s_ap_next_btn, 70, 28);
+    lv_obj_align(s_ap_next_btn, LV_ALIGN_TOP_MID, 80, 298);
+    lv_obj_set_style_bg_color(s_ap_next_btn, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_radius(s_ap_next_btn, 8, 0);
+    lv_obj_add_event_cb(s_ap_next_btn, ap_next_page_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *next_lbl = lv_label_create(s_ap_next_btn);
+    lv_label_set_text(next_lbl, "Next >");
+    lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(next_lbl);
 }
 
 static void update_ap_list_page(void)
@@ -789,33 +892,61 @@ static void update_ap_list_page(void)
 
     lv_label_set_text_fmt(s_ap_count_label, "%d APs", result.ap_count);
 
-    /* 只有 AP 数量变化时才重建列表，避免频繁重建导致点击失效 */
+    s_ap_total_pages = (result.ap_count + AP_LIST_PAGE_SIZE - 1) / AP_LIST_PAGE_SIZE;
+    if (s_ap_total_pages < 1) s_ap_total_pages = 1;
+    if (s_ap_page >= s_ap_total_pages) s_ap_page = s_ap_total_pages - 1;
+
+    lv_label_set_text_fmt(s_ap_page_label, "%d/%d", s_ap_page + 1, s_ap_total_pages);
+
+    if (s_ap_prev_btn) {
+        if (s_ap_page == 0) {
+            lv_obj_add_flag(s_ap_prev_btn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(s_ap_prev_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_ap_next_btn) {
+        if (s_ap_page >= s_ap_total_pages - 1) {
+            lv_obj_add_flag(s_ap_next_btn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(s_ap_next_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     if (s_last_ap_count == result.ap_count && result.ap_count > 0) return;
     s_last_ap_count = result.ap_count;
 
     lv_obj_clean(s_ap_list);
 
     if (result.ap_count == 0) {
-        lv_list_add_text(s_ap_list, "No APs - tap Scan");
+        lv_obj_t *empty_lbl = lv_label_create(s_ap_list);
+        lv_label_set_text(empty_lbl, "No APs - tap Scan");
+        lv_obj_set_style_text_font(empty_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty_lbl, lv_color_hex(0x607D8B), 0);
         return;
     }
 
-    ESP_LOGI(TAG, "Rebuilding AP list: %d APs", result.ap_count);
+    int start_idx = s_ap_page * AP_LIST_PAGE_SIZE;
+    int end_idx = start_idx + AP_LIST_PAGE_SIZE;
+    if (end_idx > result.ap_count) end_idx = result.ap_count;
 
-    for (int i = 0; i < result.ap_count; i++) {
+    ESP_LOGI(TAG, "Displaying AP list page %d: items %d-%d", s_ap_page + 1, start_idx, end_idx - 1);
+
+    for (int i = start_idx; i < end_idx; i++) {
         wifi_ap_info_t *ap = &result.aps[i];
+        int item_y = (i - start_idx) * 40 + 2;
 
-        lv_obj_t *list_btn = lv_list_add_btn(s_ap_list, NULL, "");
+        lv_obj_t *list_btn = lv_obj_create(s_ap_list);
+        lv_obj_set_size(list_btn, 256, 38);
+        lv_obj_set_pos(list_btn, 6, item_y);
         lv_obj_set_style_bg_color(list_btn, lv_color_hex(0x161D2A), 0);
         lv_obj_set_style_bg_opa(list_btn, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(list_btn, 6, 0);
         lv_obj_set_style_pad_all(list_btn, 0, 0);
-        lv_obj_set_size(list_btn, 264, 36);
-        lv_obj_add_event_cb(list_btn, ap_item_pressed_cb, LV_EVENT_PRESSED, (void*)(intptr_t)i);
-        lv_obj_add_event_cb(list_btn, ap_item_released_cb, LV_EVENT_RELEASED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(list_btn, ap_item_clicked_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
 
         lv_obj_t *row = lv_obj_create(list_btn);
-        lv_obj_set_size(row, 254, 30);
+        lv_obj_set_size(row, 246, 32);
         lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
         lv_obj_set_style_border_opa(row, LV_OPA_TRANSP, 0);
@@ -823,7 +954,6 @@ static void update_ap_list_page(void)
         lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
         lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);
 
-        /* SSID 标签 */
         lv_obj_t *ssid_label = lv_label_create(row);
         lv_color_t ssid_color = lv_color_hex(0xE8EDF5);
         if (ap->is_remote_id) ssid_color = lv_color_hex(0xCE93D8);
@@ -831,25 +961,23 @@ static void update_ap_list_page(void)
         lv_label_set_text_fmt(ssid_label, "%s%s",
                               ap->is_hidden ? "[H] " : "",
                               ap->ssid);
-        lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ssid_label, ssid_color, 0);
         lv_obj_align(ssid_label, LV_ALIGN_LEFT_MID, 4, 0);
         lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(ssid_label, 140);
+        lv_obj_set_width(ssid_label, 150);
         lv_obj_add_flag(ssid_label, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-        /* RSSI 数值 */
         lv_obj_t *rssi_label = lv_label_create(row);
-        lv_label_set_text_fmt(rssi_label, "%d", ap->rssi);
+        lv_label_set_text_fmt(rssi_label, "%d dBm", ap->rssi);
         lv_obj_set_style_text_font(rssi_label, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(rssi_label, lv_color_hex(0x8892A4), 0);
+        lv_obj_set_style_text_color(rssi_label, wifi_rssi_color(ap->rssi), 0);
         lv_obj_align(rssi_label, LV_ALIGN_RIGHT_MID, -4, 0);
         lv_obj_add_flag(rssi_label, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-        /* RSSI 进度条 */
         lv_obj_t *rssi_bar = lv_bar_create(row);
-        lv_obj_set_size(rssi_bar, 55, 8);
-        lv_obj_align(rssi_bar, LV_ALIGN_RIGHT_MID, -38, 0);
+        lv_obj_set_size(rssi_bar, 60, 8);
+        lv_obj_align(rssi_bar, LV_ALIGN_RIGHT_MID, -70, 0);
         lv_obj_set_style_bg_color(rssi_bar, lv_color_hex(0x1E2736), 0);
         lv_obj_set_style_bg_opa(rssi_bar, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(rssi_bar, 4, 0);

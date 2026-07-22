@@ -7,14 +7,436 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <math.h>
 
 static const char *TAG = "wifi_scan";
 
 static wifi_scan_result_t s_scan_result = {0};
 static wifi_scan_callback_t s_callback = NULL;
+
+/* ============ OpenDroneID 协议解析 ============ */
+
+/* OpenDroneID 消息类型 */
+typedef enum {
+    ODID_MSG_BASIC_ID      = 0,
+    ODID_MSG_LOCATION      = 1,
+    ODID_MSG_AUTH          = 2,
+    ODID_MSG_SELF_ID       = 3,
+    ODID_MSG_SYSTEM        = 4,
+    ODID_MSG_OPERATOR_ID   = 5,
+} odid_msg_type_t;
+
+/* 识别 OpenDroneID 的 OUI 列表（常见厂商） */
+static const uint8_t ODID_OUI_LIST[][3] = {
+    {0xFA, 0x0B, 0xBC},  /* OpenDroneID 官方 */
+    {0x90, 0x3A, 0xE6},  /* 部分无人机厂商 */
+    {0x6C, 0x9C, 0xEC},  /* DIY 设备常用 */
+};
+
+#define ODID_OUI_COUNT  (sizeof(ODID_OUI_LIST) / 3)
+
+/* 判断 OUI 是否为 OpenDroneID */
+static bool odid_match_oui(const uint8_t *oui)
+{
+    for (size_t i = 0; i < ODID_OUI_COUNT; i++) {
+        if (memcmp(oui, ODID_OUI_LIST[i], 3) == 0) return true;
+    }
+    return false;
+}
+
+/* 识别 Vendor Specific Content 中是否含 OpenDroneID 标识
+ * ASTM F3411 规范：Vendor Specific Content 起始字节为 0x0D (Odd) 的 Message Type
+ * 也可通过特定 OUI+Payload 标识判断
+ */
+static bool odid_is_valid_payload(const uint8_t *data, int len)
+{
+    if (len < 2) return false;
+    /* ODID 消息第一字节: 高4位=消息类型(0-5), 低4位=协议版本(通常为1) */
+    uint8_t msg_type = data[0] >> 4;
+    uint8_t proto_ver = data[0] & 0x0F;
+    if (msg_type > 5) return false;
+    if (proto_ver == 0 || proto_ver > 3) return false;
+    return true;
+}
+
+/* 解析 Basic ID 消息 (Message Type 0, 25字节) */
+static void odid_parse_basic_id(const uint8_t *data, int len, wifi_ap_info_t *ap)
+{
+    if (len < 25) return;
+    /* 数据结构:
+     * [0]   类型+版本
+     * [1]   ID Type (高4) + UAS Type (低4)
+     * [2-19] UAS ID (16字节)
+     */
+    uint8_t uas_type = data[1] & 0x0F;
+
+    /* UAS ID 为 16 字节 ASCII */
+    char uas_id[17] = {0};
+    memcpy(uas_id, &data[2], 16);
+    /* 去除尾部空格 */
+    for (int i = 15; i >= 0 && uas_id[i] == ' '; i--) uas_id[i] = '\0';
+
+    snprintf(ap->uas_id, sizeof(ap->uas_id), "%s", uas_id);
+    if (ap->rid_code[0] == '\0') {
+        snprintf(ap->rid_code, sizeof(ap->rid_code), "%s", uas_id);
+    }
+
+    /* 根据 UAS Type 映射设备类型 */
+    switch (uas_type) {
+        case 1: ap->device_type = RID_DEVICE_TYPE_ROTOR; break;
+        case 2: ap->device_type = RID_DEVICE_TYPE_FIXED_WING; break;
+        case 3: ap->device_type = RID_DEVICE_TYPE_HELIX; break;
+        case 4: ap->device_type = RID_DEVICE_TYPE_MULTI_ROTOR; break;
+        case 5: ap->device_type = RID_DEVICE_TYPE_HYBRID; break;
+        default: ap->device_type = RID_DEVICE_TYPE_OTHER; break;
+    }
+}
+
+/* 解析 Location 消息 (Message Type 1, 25字节) */
+static void odid_parse_location(const uint8_t *data, int len, wifi_ap_info_t *ap)
+{
+    if (len < 25) return;
+    /* 数据结构（ASTM F3411）:
+     * [0]   类型+版本
+     * [1]   Status (高4) + Reserved (低4)
+     * [2]   Direction (高8位, 实际 10 位中的高8位)
+     * [3]   Direction 低2位 (高2) + Speed 高6位
+     * [4]   Speed 低4位 (高4) + Vertical Speed 高4位
+     * [5]   Vertical Speed 低8位
+     * [6-9]   Latitude (4字节, 压缩整数)
+     * [10-13] Longitude (4字节, 压缩整数)
+     * [14]    Altitude Pressure (高8位, 16位中的高8位)
+     * [15]    Altitude Pressure 低8位
+     * [16]    Altitude Geodetic (高8位)
+     * [17]    Altitude Geodetic 低8位
+     * [18]    Height (高8位)
+     * [19]    Height 低8位
+     * [20]    Horiz Accuracy (高4) + Vert Accuracy (低4)
+     * [21]    Baro Accuracy (高4) + Speed Accuracy (低4)
+     * [22]    Time Accuracy (高4) + Reserved (低4)
+     * [23]    Timestamp
+     * [24]    Reserved
+     */
+    uint8_t status = data[1] >> 4;
+
+    /* 方向 (0-359.9 度, 1/10 度精度) */
+    uint16_t direction_raw = (data[2] << 2) | (data[3] >> 6);
+    ap->heading = direction_raw * 0.1f;
+    if (ap->heading >= 360.0f) ap->heading -= 360.0f;
+
+    /* 水平速度 (0-254.25 m/s, 0.25 m/s 精度) */
+    uint16_t speed_raw = ((data[3] & 0x3F) << 4) | (data[4] >> 4);
+    ap->ground_speed = speed_raw * 0.25f;
+    ap->speed = ap->ground_speed;
+
+    /* 垂直速度 (±62 m/s, 0.5 m/s 精度) */
+    int16_t vspeed_raw = ((data[4] & 0x0F) << 8) | data[5];
+    if (vspeed_raw & 0x0800) vspeed_raw |= 0xF000;  /* 符号扩展 */
+    ap->vertical_speed = vspeed_raw * 0.5f;
+
+    /* 纬度 (±90度, 1e-7 度精度) */
+    int32_t lat_raw = ((int32_t)data[6] << 24) | ((int32_t)data[7] << 16) |
+                      ((int32_t)data[8] << 8) | data[9];
+    ap->latitude = lat_raw / 1e7f;
+
+    /* 经度 (±180度, 1e-7 度精度) */
+    int32_t lon_raw = ((int32_t)data[10] << 24) | ((int32_t)data[11] << 16) |
+                      ((int32_t)data[12] << 8) | data[13];
+    ap->longitude = lon_raw / 1e7f;
+
+    /* 气压高度 (相对海平面, 米, 0.5米精度, -1000起算) */
+    uint16_t alt_p_raw = (data[14] << 8) | data[15];
+    int32_t alt_pressure = alt_p_raw * 5 - 1000;
+
+    /* 几何高度 (相对起飞点, 米, 0.5米精度, -1000起算) */
+    uint16_t alt_g_raw = (data[16] << 8) | data[17];
+    ap->altitude = alt_g_raw * 5 - 1000;
+
+    /* 时间戳 (0.1秒精度) */
+    ap->timestamp = data[23];
+
+    /* 运行状态映射 */
+    switch (status) {
+        case 1: ap->op_state = RID_OP_STATE_IDLE; break;
+        case 2: ap->op_state = RID_OP_STATE_FLYING; break;
+        case 3: ap->op_state = RID_OP_STATE_LANDING; break;
+        case 4: ap->op_state = RID_OP_STATE_EMERGENCY; break;
+        default: ap->op_state = RID_OP_STATE_UNKNOWN; break;
+    }
+    (void)alt_pressure;
+}
+
+/* 解析 System 消息 (Message Type 4, 25字节) */
+static void odid_parse_system(const uint8_t *data, int len, wifi_ap_info_t *ap)
+{
+    if (len < 25) return;
+    /* [0]  类型+版本
+     * [1]  Reserved
+     * [2]  Operator Location Type (高2) + Classification Type (2位) + Reserved
+     * [3]  Operator Latitude (高8位)
+     * [4-6] Operator Latitude 低24位
+     * [7]  Operator Longitude (高8位)
+     * [8-10] Operator Longitude 低24位
+     * ...
+     * [16] Area Count (高8)
+     * [17] Area Count 低8 + Area Radius (高4)
+     * [18] Area Radius 低8 + Area Ceiling (高8位)
+     * [19] Area Ceiling 低8
+     * [20] Area Floor (高8)
+     * [21] Area Floor 低8
+     * [22] Category (高4) + Class (低4)
+     * [23] Operator Altitude (高8)
+     * [24] Operator Altitude 低8
+     */
+    /* 卫星数（部分实现放在 [1] 字节） */
+    ap->satellites = data[1];
+
+    /* 无人驾驶航空器分类 */
+    uint8_t category = data[22] >> 4;
+    if (category >= 1 && category <= 5) {
+        ap->device_type = (rid_device_type_t)category;
+    }
+}
+
+/* 解析 Operator ID 消息 (Message Type 5, 25字节) */
+static void odid_parse_operator_id(const uint8_t *data, int len, wifi_ap_info_t *ap)
+{
+    if (len < 25) return;
+    /* [0]  类型+版本
+     * [1]  Operator ID Type
+     * [2-21] Operator ID (20字节 ASCII)
+     */
+    char op_id[21] = {0};
+    memcpy(op_id, &data[2], 20);
+    for (int i = 19; i >= 0 && op_id[i] == ' '; i--) op_id[i] = '\0';
+    snprintf(ap->operator_id, sizeof(ap->operator_id), "%s", op_id);
+}
+
+/* 解析 Self ID 消息 (Message Type 3, 25字节) */
+static void odid_parse_self_id(const uint8_t *data, int len, wifi_ap_info_t *ap)
+{
+    if (len < 25) return;
+    /* [0]  类型+版本
+     * [1]  Self ID Type
+     * [2-23] Self ID 描述 (22字节 ASCII)
+     */
+    char desc[23] = {0};
+    memcpy(desc, &data[2], 22);
+    for (int i = 21; i >= 0 && desc[i] == ' '; i--) desc[i] = '\0';
+    snprintf(ap->self_id_desc, sizeof(ap->self_id_desc), "%s", desc);
+}
+
+/* 解析一条 ODID 消息 */
+static void odid_parse_message(const uint8_t *data, int len, wifi_ap_info_t *ap)
+{
+    if (len < 1) return;
+    uint8_t msg_type = data[0] >> 4;
+    uint8_t proto_ver = data[0] & 0x0F;
+    ESP_LOGI(TAG, "ODID msg: type=%d, ver=%d, len=%d", msg_type, proto_ver, len);
+
+    ap->rid_version = proto_ver;
+    ap->rid_from_beacon = true;
+
+    switch (msg_type) {
+        case ODID_MSG_BASIC_ID:
+            odid_parse_basic_id(data, len, ap);
+            break;
+        case ODID_MSG_LOCATION:
+            odid_parse_location(data, len, ap);
+            break;
+        case ODID_MSG_SELF_ID:
+            odid_parse_self_id(data, len, ap);
+            break;
+        case ODID_MSG_SYSTEM:
+            odid_parse_system(data, len, ap);
+            break;
+        case ODID_MSG_OPERATOR_ID:
+            odid_parse_operator_id(data, len, ap);
+            break;
+        default:
+            break;
+    }
+}
+
+/* ============ Promiscuous 模式回调 ============ */
+
+/* 临时存储待合并的 RID 设备 (来自 Beacon 解析) */
+#define MAX_RID_DEVICES  16
+static wifi_ap_info_t s_rid_devices[MAX_RID_DEVICES];
+static volatile int s_rid_device_count = 0;
+
+/* 查找已记录的 RID 设备 (按 BSSID 匹配) */
+static wifi_ap_info_t *rid_find_device(const uint8_t *bssid)
+{
+    for (int i = 0; i < s_rid_device_count; i++) {
+        if (memcmp(s_rid_devices[i].bssid, bssid, 6) == 0) {
+            return &s_rid_devices[i];
+        }
+    }
+    return NULL;
+}
+
+/* 添加或更新 RID 设备 */
+static wifi_ap_info_t *rid_add_device(const uint8_t *bssid, int8_t rssi, uint8_t channel)
+{
+    wifi_ap_info_t *dev = rid_find_device(bssid);
+    if (dev) {
+        if (rssi > dev->rssi) dev->rssi = rssi;
+        return dev;
+    }
+    if (s_rid_device_count >= MAX_RID_DEVICES) return NULL;
+
+    int idx = s_rid_device_count++;
+    dev = &s_rid_devices[idx];
+    memset(dev, 0, sizeof(wifi_ap_info_t));
+    memcpy(dev->bssid, bssid, 6);
+    dev->rssi = rssi;
+    dev->channel = channel;
+    dev->primary_channel = channel;
+    dev->is_remote_id = true;
+    dev->rid_from_beacon = true;
+    dev->auth_mode = WIFI_AUTH_OPEN;
+    snprintf(dev->ssid, sizeof(dev->ssid), "RID-%02X%02X%02X",
+             bssid[3], bssid[4], bssid[5]);
+    snprintf(dev->remote_id, sizeof(dev->remote_id), "ODID-%02X%02X%02X",
+             bssid[3], bssid[4], bssid[5]);
+    return dev;
+}
+
+/* 解析 802.11 管理帧中的 Vendor Specific IE */
+static void parse_vendor_ie(const uint8_t *payload, int len, const uint8_t *bssid,
+                             int8_t rssi, uint8_t channel)
+{
+    /* 跳过 Fixed Fields (24字节 MAC头 + 12字节 Beacon Fixed = 36 字节) */
+    if (len < 36) return;
+
+    int offset = 36;
+    while (offset + 2 < len) {
+        uint8_t elem_id  = payload[offset];
+        uint8_t elem_len = payload[offset + 1];
+
+        if (offset + 2 + elem_len > len) break;
+
+        if (elem_id == 221 && elem_len >= 5) {
+            /* Vendor Specific IE: [OUI 3字节][OUI Type 1字节][Payload] */
+            const uint8_t *oui = &payload[offset + 2];
+            const uint8_t *vendor_payload = &payload[offset + 5];
+            int vendor_len = elem_len - 3;
+
+            /* 匹配 OUI 或检测 ODID 有效载荷 */
+            if (odid_match_oui(oui) || odid_is_valid_payload(vendor_payload, vendor_len)) {
+                /* 注册或查找设备 */
+                wifi_ap_info_t *dev = rid_add_device(bssid, rssi, channel);
+                if (dev) {
+                    ESP_LOGI(TAG, "ODID Vendor IE found, BSSID=%02X:%02X:%02X:%02X:%02X:%02X, len=%d",
+                             bssid[0],bssid[1],bssid[2],bssid[3],bssid[4],bssid[5], vendor_len);
+                    /* ODID 消息为 25 字节 */
+                    if (vendor_len >= 25) {
+                        odid_parse_message(vendor_payload, 25, dev);
+                    } else {
+                        odid_parse_message(vendor_payload, vendor_len, dev);
+                    }
+                }
+            }
+        }
+        offset += 2 + elem_len;
+    }
+}
+
+/* Promiscuous 模式回调 - 在中断上下文执行，不能使用 semaphore */
+static void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *payload = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+
+    if (len < 24) return;
+
+    uint8_t frame_type = payload[0] & 0x0C;
+    if (frame_type != 0x00) return;
+
+    uint8_t subtype = (payload[0] >> 4) & 0x0F;
+    if (subtype != 0x08 && subtype != 0x05) return;
+
+    const uint8_t *bssid = &payload[16];
+    int8_t rssi = pkt->rx_ctrl.rssi;
+    uint8_t channel = pkt->rx_ctrl.channel;
+
+    parse_vendor_ie(payload, len, bssid, rssi, channel);
+}
+
+/* 启动 Promiscuous 监听 (持续 duration_ms 毫秒) */
+static void run_promiscuous_scan(uint32_t duration_ms)
+{
+    ESP_LOGI(TAG, "Starting promiscuous RID scan for %lu ms", (unsigned long)duration_ms);
+
+    s_rid_device_count = 0;
+    memset(s_rid_devices, 0, sizeof(s_rid_devices));
+
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_cb);
+    esp_wifi_set_promiscuous(true);
+
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+
+    esp_wifi_set_promiscuous(false);
+
+    ESP_LOGI(TAG, "Promiscuous scan done, captured %d RID devices", s_rid_device_count);
+}
+
+/* 将 Promiscuous 模式捕获的 RID 设备合并到扫描结果 */
+/* 注意：调用前必须先关闭 promiscuous 模式，确保无中断写入 */
+static void merge_rid_devices(void)
+{
+    for (int i = 0; i < s_rid_device_count; i++) {
+        wifi_ap_info_t *rid_dev = &s_rid_devices[i];
+
+        bool found = false;
+        for (int j = 0; j < s_scan_result.ap_count; j++) {
+            if (memcmp(s_scan_result.aps[j].bssid, rid_dev->bssid, 6) == 0) {
+                wifi_ap_info_t *ap = &s_scan_result.aps[j];
+                ap->is_remote_id = true;
+                ap->rid_from_beacon = true;
+                if (rid_dev->uas_id[0]) memcpy(ap->uas_id, rid_dev->uas_id, sizeof(ap->uas_id));
+                if (rid_dev->operator_id[0]) memcpy(ap->operator_id, rid_dev->operator_id, sizeof(ap->operator_id));
+                if (rid_dev->rid_code[0]) memcpy(ap->rid_code, rid_dev->rid_code, sizeof(ap->rid_code));
+                if (rid_dev->rid_version) ap->rid_version = rid_dev->rid_version;
+                if (rid_dev->latitude != 0) ap->latitude = rid_dev->latitude;
+                if (rid_dev->longitude != 0) ap->longitude = rid_dev->longitude;
+                if (rid_dev->altitude != -1000) ap->altitude = rid_dev->altitude;
+                if (rid_dev->speed != 0) ap->speed = rid_dev->speed;
+                if (rid_dev->ground_speed != 0) ap->ground_speed = rid_dev->ground_speed;
+                if (rid_dev->vertical_speed != 0) ap->vertical_speed = rid_dev->vertical_speed;
+                if (rid_dev->heading != 0) ap->heading = rid_dev->heading;
+                if (rid_dev->op_state != RID_OP_STATE_UNKNOWN) ap->op_state = rid_dev->op_state;
+                if (rid_dev->device_type != RID_DEVICE_TYPE_UNKNOWN) ap->device_type = rid_dev->device_type;
+                if (rid_dev->satellites) ap->satellites = rid_dev->satellites;
+                if (rid_dev->self_id_desc[0]) memcpy(ap->self_id_desc, rid_dev->self_id_desc, sizeof(ap->self_id_desc));
+                if (rid_dev->timestamp) ap->timestamp = rid_dev->timestamp;
+
+                ESP_LOGI(TAG, "Merged ODID into existing AP[%d]: %s", j, ap->ssid);
+                found = true;
+                break;
+            }
+        }
+
+        if (!found && s_scan_result.ap_count < WIFI_MAX_SCAN_RESULTS) {
+            wifi_ap_info_t *ap = &s_scan_result.aps[s_scan_result.ap_count++];
+            memcpy(ap, rid_dev, sizeof(wifi_ap_info_t));
+            ESP_LOGI(TAG, "Added new ODID-only device[%d]: %s", s_scan_result.ap_count - 1, ap->ssid);
+        }
+    }
+}
+
 
 static const char *s_auth_mode_names[] = {
     "OPEN",
@@ -336,13 +758,24 @@ static void wifi_scan_task(void *arg)
     
     wifi_scan_analyze_channels();
 
+    /* === 第二阶段：Promiscuous 模式监听 RID Beacon (3秒) === */
+    ESP_LOGI(TAG, "Starting promiscuous RID scan stage...");
+    run_promiscuous_scan(3000);
+
+    /* 合并 Promiscuous 阶段捕获的 RID 设备 */
+    merge_rid_devices();
+
+    /* 重新统计信道（RID 设备可能新增） */
+    wifi_scan_analyze_channels();
+
     s_scan_result.scanning = false;
 
     if (s_callback) {
         s_callback(&s_scan_result);
     }
 
-    ESP_LOGI(TAG, ">>> WiFi scan completed, found %d APs", ap_count);
+    ESP_LOGI(TAG, ">>> WiFi scan completed, found %d APs (incl. RID devices)",
+             s_scan_result.ap_count);
 
     vTaskDelete(NULL);
 }
